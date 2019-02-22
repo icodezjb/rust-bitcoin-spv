@@ -1,33 +1,32 @@
 [package]
-name = "bitcoin-spv"
+name = "murmel"
 version = "0.1.0"
 authors = ["Tamas Blummer <tamas.blummer@gmail.com>"]
 license = "Apache-2.0"
-homepage = "https://github.com/rust-bitcoin/rust-bitcoin-spv/"
-repository = "https://github.com/rust-bitcoin/rust-bitcoin-spv/"
-documentation = "https://github.com/rust-bitcoin/rust-bitcoin-spv/"
-description = "SPV client for Bitcoin"
-keywords = [ "crypto", "bitcoin" ]
+homepage = "https://github.com/rust-bitcoin/murmel/"
+repository = "https://github.com/rust-bitcoin/murmel/"
+documentation = "https://github.com/rust-bitcoin/murmel/"
+description = "Murmel Bitcoin node"
+keywords = [ "bitcoin" ]
 readme = "README.md"
 
 [lib]
-name = "bitcoin_spv"
+name = "murmel"
 path = "src/lib.rs"
 
-[[bin]]
-name = "bitcoin_spv"
-path = "src/bin/main.rs"
-
 [dependencies]
-bitcoin = { version = "0.13", features = ["bitcoinconsensus"] }
-bitcoin-chain = { git = "https://github.com/tamasblummer/rust-bitcoin-chain", branch = "send" }
-lightning = { git = "https://github.com/rust-bitcoin/rust-lightning", branch = "master" }
+lightning = "0.0.8"
+bitcoin = { version="0.16", features = ["bitcoinconsensus"] }
+hammersbald = { version="1.5.1", features=["bitcoin_support"]}
 mio = "0.6"
-rand = "0.4"
+rand = "0.5"
 siphasher = "0.2"
 log = "0.4"
 simple_logger = "0.5.0"
 rusqlite = { version = "0.13.0", features = ["bundled"] }
+byteorder = "1.2"
+lru-cache = "0.1.1"
+rayon = "1.0.3"
 futures={ git= "https://github.com/tamasblummer/futures-rs.git", tag = "0.2.1" }
 futures-timer= { git= "https://github.com/tamasblummer/futures-timer.git", branch = "futures_0.2.1" }
 
@@ -37,4 +36,4 @@ hex = "0.3"
 tempfile = "3.0.2"
 
 [patch.crates-io]
-bitcoin = { git="https://github.com/tamasblummer/rust-bitcoin", branch = "bip157" }
+bitcoin = { git= "https://github.com/tamasblummer/rust-bitcoin.git", branch = "open_prs_0.16", features = ["bitcoinconsensus"] }

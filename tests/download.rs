@@ -1,6 +1,6 @@
 extern crate tempfile;
 extern crate bitcoin;
-extern crate bitcoin_spv;
+extern crate murmel;
 extern crate simple_logger;
 extern crate log;
 
@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 use std::{thread, time};
 
 use bitcoin::network::constants::Network;
-use bitcoin_spv::spv::SPV;
+use murmel::constructor::Constructor;
 use log::Level;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -82,8 +82,8 @@ fn download() {
     let mut peers = Vec::new();
     peers.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 28333));
     thread::spawn(|| {
-        let mut spv = SPV::new_in_memory("/rust-spv:0.1.0/".to_string(), Network::Regtest).unwrap();
-        spv.start(peers, 1, true);
+        let mut spv = Constructor::new_in_memory("/rust-spv:0.1.0/".to_string(), Network::Regtest, vec!(), false, 0, 0).unwrap();
+        spv.run(peers, 1, true).unwrap();
     });
     thread::sleep(time::Duration::from_secs(5));
 }

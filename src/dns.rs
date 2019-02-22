@@ -1,5 +1,5 @@
 //
-// Copyright 2018 Tamas Blummer
+// Copyright 2018-2019 Tamas Blummer
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,8 +22,8 @@
 //!
 //!
 
-use std::net::{SocketAddr, ToSocketAddrs};
 use bitcoin::network::constants::Network;
+use std::net::{SocketAddr, ToSocketAddrs};
 
 const MAIN_SEEDER: [&str;5] = [
     "seed.bitcoin.sipa.be",

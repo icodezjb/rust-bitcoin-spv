@@ -1,5 +1,5 @@
 //
-// Copyright 2018 Tamas Blummer
+// Copyright 2018-2019 Tamas Blummer
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,106 +14,154 @@
 // limitations under the License.
 //
 //!
-//! # SPV
+//! # Construct the Murmel stack
 //!
-//! Assembles modules of this library to a complete SPV service
+//! Assembles modules of this library to a complete service
 //!
 
-use bitcoin::network::constants::Network;
-use database::DB;
-use error::SPVError;
-use lightning::chain::chaininterface::ChainWatchInterface;
-use node::Node;
-use p2p::P2P;
-use std::net::SocketAddr;
-use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
-use p2p::{PeerMap, PeerSource};
-use futures::future;
-use futures::prelude::*;
-use futures::executor::ThreadPool;
+use bitcoin::{
+    network::{
+        constants::Network
+    }
+};
+use connector::{SharedLightningConnector, LightningConnector};
+use chaindb::ChainDB;
+use configdb::{ConfigDB, SharedConfigDB};
+use dispatcher::Dispatcher;
 use dns::dns_seed;
-use rand::{thread_rng, Rng};
-use std::collections::HashSet;
+use error::MurmelError;
+use futures::{
+    executor::ThreadPool,
+    future,
+    prelude::*
+};
+use p2p::{P2P, P2PControl, PeerMessageSender, PeerSource, SERVICE_BLOCKS, SERVICE_FILTERS};
+use rand::{RngCore, thread_rng};
+use std::{
+    collections::HashSet,
+    net::SocketAddr,
+    path::Path,
+    sync::{Arc, mpsc, Mutex, RwLock}
+};
 
 const MAX_PROTOCOL_VERSION :u32 = 70001;
 
-/// The complete SPV stack
-pub struct SPV{
-	node: Arc<Node>,
-	p2p: Arc<P2P>,
-    thread_pool: ThreadPool,
-    db: Arc<Mutex<DB>>
+/// The complete stack
+pub struct Constructor {
+    p2p: Arc<P2P>,
+    configdb: SharedConfigDB,
+    dispatcher: Arc<Dispatcher>,
+    /// this should be accessed by Lightning
+    pub lightning: SharedLightningConnector,
+    server: bool
 }
 
-impl SPV {
-    /// Initialize the SPV stack and return a ChainWatchInterface
+impl Constructor {
+    /// Initialize the stack and return a ChainWatchInterface
     /// Set
     ///      network - main or testnet
-    ///      bootstrap - peer adresses (only tested to work with one local node for now)
-    ///      db - file path to store the headers and blocks database
+    ///      bootstrap - peer addresses (only tested to work with one local node for now)
+    ///      db - file path to data
     /// The method will read previously stored headers from the database and sync up with the peers
     /// then serve the returned ChainWatchInterface
-    pub fn new(user_agent :String, network: Network, db: &Path) -> Result<SPV, SPVError> {
-        let thread_pool = ThreadPool::new()?;
-        let db = Arc::new(Mutex::new(DB::new(db)?));
-        let birth = create_tables(db.clone())?;
-        let peers = Arc::new(RwLock::new(PeerMap::new()));
-        let p2p = Arc::new(P2P::new(user_agent, network, 0, peers.clone(), db.clone(), MAX_PROTOCOL_VERSION));
-        let node = Arc::new(Node::new(p2p.clone(), network, db.clone(), true, peers.clone()));
-        Ok(SPV{ node, p2p, thread_pool, db: db.clone() })
+    pub fn new(user_agent :String, network: Network, path: &Path, listen: Vec<SocketAddr>, server: bool, script_cache_size: usize, birth: u64) -> Result<Constructor, MurmelError> {
+        let configdb = Arc::new(Mutex::new(ConfigDB::new(path)?));
+        create_tables(configdb.clone(), birth)?;
+        let chaindb = Arc::new(RwLock::new(ChainDB::new(path, network,server, script_cache_size, birth)?));
+
+        let back_pressure = if server {
+            1000
+        } else {
+            10
+        };
+
+        let (to_dispatcher, from_p2p) = mpsc::sync_channel(back_pressure);
+
+        let (p2p, p2p_control) =
+            P2P::new(user_agent.clone(), network, 0, MAX_PROTOCOL_VERSION, server,
+                     PeerMessageSender::new(to_dispatcher), back_pressure);
+
+        let lightning = Arc::new(Mutex::new(LightningConnector::new(network, p2p_control.clone())));
+
+        let dispatcher =
+            Dispatcher::new(network, configdb.clone(), chaindb.clone(), server, p2p_control.clone(), from_p2p, lightning.clone());
+
+        for addr in &listen {
+            p2p_control.send(P2PControl::Bind(addr.clone()));
+        }
+
+        Ok(Constructor { p2p, dispatcher, configdb, server, lightning })
     }
 
-    /// Initialize the SPV stack and return a ChainWatchInterface
+    /// Initialize the stack and return a ChainWatchInterface
     /// Set
     ///      network - main or testnet
     ///      bootstrap - peer adresses (only tested to work with one local node for now)
     /// The method will start with an empty in-memory database and sync up with the peers
     /// then serve the returned ChainWatchInterface
-    pub fn new_in_memory(user_agent :String, network: Network) -> Result<SPV, SPVError> {
-        let thread_pool = ThreadPool::new()?;
-        let db = Arc::new(Mutex::new(DB::mem()?));
-        let birth = create_tables(db.clone())?;
-        let peers = Arc::new(RwLock::new(PeerMap::new()));
-        let p2p = Arc::new(P2P::new(user_agent, network, 0, peers.clone(), db.clone(), MAX_PROTOCOL_VERSION));
-        let node = Arc::new(Node::new(p2p.clone(), network, db.clone(), true, peers.clone()));
-        Ok(SPV{ node, p2p, thread_pool, db: db.clone()})
+    pub fn new_in_memory(user_agent :String, network: Network, listen: Vec<SocketAddr>, server: bool, script_cache_size: usize, birth: u64) -> Result<Constructor, MurmelError> {
+        let configdb = Arc::new(Mutex::new(ConfigDB::mem()?));
+        let chaindb = Arc::new(RwLock::new(ChainDB::mem( network,server, script_cache_size, birth)?));
+        create_tables(configdb.clone(), birth)?;
+        let back_pressure = if server {
+            1000
+        } else {
+            10
+        };
+
+        let (to_dispatcher, from_p2p) = mpsc::sync_channel(back_pressure);
+
+        let (p2p, p2p_control) =
+            P2P::new(user_agent.clone(), network, 0, MAX_PROTOCOL_VERSION, server,
+                     PeerMessageSender::new(to_dispatcher), back_pressure);
+
+        let lightning = Arc::new(Mutex::new(LightningConnector::new(network, p2p_control.clone())));
+
+        let dispatcher =
+            Dispatcher::new(network, configdb.clone(), chaindb.clone(), server, p2p_control.clone(), from_p2p, lightning.clone());
+
+        for addr in &listen {
+            p2p_control.send(P2PControl::Bind(addr.clone()));
+        }
+
+        Ok(Constructor { p2p, dispatcher, configdb, server, lightning })
     }
 
-    /// add a listener of incoming connection requests
-    pub fn listen (&self, addr: &SocketAddr) -> Result<(), SPVError> {
-        Ok(self.p2p.add_listener(addr)?)
-    }
-
-	/// Start the SPV stack. This should be called AFTER registering listener of the ChainWatchInterface,
-	/// so they are called as the SPV stack catches up with the blockchain
+	/// Run the stack. This should be called AFTER registering listener of the ChainWatchInterface,
+	/// so they are called as the stack catches up with the blockchain
 	/// * peers - connect to these peers at startup (might be empty)
-	/// * min_connections - keep connections with at least this number of peers. Peers will be chosen random
+	/// * min_connections - keep connections with at least this number of peers. Peers will be randomly chosen
 	/// from those discovered in earlier runs
-    pub fn start (&mut self, peers: Vec<SocketAddr>, min_connections: usize, nodns: bool) {
-        // read stored headers from db
-        // there is no recovery if this fails
-        self.node.load_headers().unwrap();
+    pub fn run(&mut self, peers: Vec<SocketAddr>, min_connections: usize, nodns: bool) -> Result<(), MurmelError>{
 
-        let p2p = self.p2p.clone();
-        let node = self.node.clone();
+        self.dispatcher.init(self.server).unwrap();
+
+        let needed_services = if self.server {
+            0
+        } else {
+            SERVICE_BLOCKS + SERVICE_FILTERS
+        };
+
+        let p2p2 = self.p2p.clone();
+        let p2p_task = Box::new(future::poll_fn (move |ctx| {
+            p2p2.run(needed_services, ctx).unwrap();
+            Ok(Async::Ready(()))
+        }));
+
+        let mut thread_pool = ThreadPool::new()?;
 
         // start the task that runs all network communication
-        self.thread_pool.spawn (Box::new(future::poll_fn (move |ctx| {
-            p2p.run(node.clone(), ctx).unwrap();
-            Ok(Async::Ready(()))
-        }))).unwrap();
-
-        let connector = self.keep_connected(peers, min_connections, nodns);
+        thread_pool.spawn (p2p_task).unwrap();
 
         // the task that keeps us connected
-        self.thread_pool.run(connector).unwrap();
+        // note that this call does not return
+        thread_pool.run(self.keep_connected(self.p2p.clone(), peers, min_connections, nodns)).unwrap();
+        Ok(())
     }
 
-    fn keep_connected(&self, peers: Vec<SocketAddr>, min_connections: usize, nodns: bool) -> Box<Future<Item=(), Error=Never> + Send> {
+    fn keep_connected(&self, p2p: Arc<P2P>, peers: Vec<SocketAddr>, min_connections: usize, nodns: bool) -> Box<Future<Item=(), Error=Never> + Send> {
 
-        let p2p = self.p2p.clone();
-        let db = self.db.clone();
+        let db = self.configdb.clone();
 
         // add initial peers if any
         let mut added = Vec::new();
@@ -123,8 +171,8 @@ impl SPV {
 
         struct KeepConnected {
             min_connections: usize,
-            connections: Vec<Box<Future<Item=SocketAddr, Error=SPVError> + Send>>,
-            db: Arc<Mutex<DB>>,
+            connections: Vec<Box<Future<Item=SocketAddr, Error=MurmelError> + Send>>,
+            db: Arc<Mutex<ConfigDB>>,
             p2p: Arc<P2P>,
             dns: Vec<SocketAddr>,
             earlier: HashSet<SocketAddr>,
@@ -182,7 +230,7 @@ impl SPV {
                         // found a peer
                         if let Ok(peer) = tx.get_a_peer(&self.earlier) {
                             // have an address for it
-                            // Note: we do not store Tor adresses, so this should always be true
+                            // Note: we do not store Tor addresses, so this should always be true
                             if let Ok(ref sock) = peer.socket_addr() {
                                 self.earlier.insert(*sock);
                                 self.connections.push(self.p2p.add_peer(PeerSource::Outgoing(sock.clone())));
@@ -214,21 +262,16 @@ impl SPV {
 
         Box::new(KeepConnected{min_connections, connections: added, db, p2p, dns: Vec::new(), nodns, earlier: HashSet::new() })
 	}
-
-    /// Get the connector to higher level appl layers, such as Lightning
-    pub fn get_chain_watch_interface (&self) -> Arc<ChainWatchInterface> {
-        return self.node.get_chain_watch_interface();
-    }
-
 }
 
 
 
 /// create tables (if not already there) in the database
-fn create_tables(db: Arc<Mutex<DB>>) -> Result<u32, SPVError> {
+fn create_tables(db: Arc<Mutex<ConfigDB>>, birth: u64) -> Result<(), MurmelError> {
     let mut db = db.lock().unwrap();
-    let tx = db.transaction()?;
-    let birth = tx.create_tables()?;
+    let mut tx = db.transaction()?;
+    tx.create_tables()?;
+    tx.set_birth(birth)?;
     tx.commit()?;
-    Ok(birth)
+    Ok(())
 }

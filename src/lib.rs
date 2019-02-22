@@ -1,5 +1,5 @@
 //
-// Copyright 2018 Tamas Blummer
+// Copyright 2018-2019 Tamas Blummer
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,9 +14,9 @@
 // limitations under the License.
 //
 //!
-//! # Bitcoin SPV client
+//! # Murmel Bitcoin node
 //!
-//! This library implements a Simplified Payment Verification (SPV) client for Bitcoin
+//! This library implements a Simplified Payment Verification (SPV) of Bitcoin
 //!
 
 #![deny(non_upper_case_globals)]
@@ -26,26 +26,37 @@
 #![deny(missing_docs)]
 #![deny(unused_must_use)]
 
-extern crate mio;
 extern crate bitcoin;
-extern crate bitcoin_chain;
 extern crate lightning;
-#[macro_use]
-extern crate log;
-extern crate rand;
-extern crate rusqlite;
-extern crate siphasher;
+extern crate byteorder;
 extern crate futures;
 extern crate futures_timer;
+extern crate hammersbald;
+#[macro_use]
+extern crate log;
+extern crate lru_cache;
+extern crate mio;
+extern crate rand;
+extern crate rayon;
+extern crate rusqlite;
+extern crate siphasher;
 
-mod node;
-mod database;
-mod error;
-#[allow(dead_code)]
 mod connector;
-pub mod spv;
-#[allow(dead_code)]
+mod filtered;
+mod ping;
+mod timeout;
+mod blockserver;
+mod scriptcache;
+mod filterserver;
+mod headerdownload;
+mod headercache;
+mod filtercache;
+mod chaindb;
+mod filtercalculator;
+mod configdb;
+mod dispatcher;
+mod error;
 mod blockfilter;
 mod p2p;
 mod dns;
-mod tasks;
+pub mod constructor;

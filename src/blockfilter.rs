@@ -1,5 +1,5 @@
 //
-// Copyright 2018 Tamas Blummer
+// Copyright 2018-2019 Tamas Blummer
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,20 +21,33 @@
 //! that minimizes filter size by using Golomb-Rice coding for compression.
 //!
 
-use bitcoin;
-use bitcoin::blockdata::block::Block;
-use bitcoin::blockdata::script::Script;
-use bitcoin::network::encodable::{ConsensusDecodable, ConsensusEncodable};
-use bitcoin::network::encodable::VarInt;
-use bitcoin::network::serialize::{RawDecoder, RawEncoder};
-use bitcoin::network::serialize::BitcoinHash;
-use bitcoin::util::hash::Sha256dHash;
+use bitcoin::{
+    blockdata::{
+        transaction::OutPoint,
+        block::Block
+    }
+};
+use bitcoin::{
+    consensus::{Decodable, Encodable, encode::VarInt},
+    util::hash::{BitcoinHash, Sha256dHash}
+};
+use chaindb::ScriptAccessor;
+use error::MurmelError;
 use siphasher::sip::SipHasher;
-use std::cmp;
-use std::collections::HashSet;
-use std::hash::Hasher;
-use std::io::Cursor;
-use std::io;
+use std::{
+    cmp,
+    collections::HashSet,
+    hash::Hasher,
+    io::{self, Cursor}
+
+};
+
+// BIP158 base filter: input and output scripts
+pub const SCRIPT_FILTER:u8 = 0;
+// filter most suitable for a wallet: output scripts and input coins
+pub const WALLET_FILTER:u8 = 1;
+// filter suitable to find a coin in absence of cache: output coins only
+pub const COIN_FILTER:u8 = 2;
 
 const P: u8 = 19;
 const M: u64 = 784931;
@@ -48,15 +61,39 @@ pub struct BlockFilter {
 
 impl BlockFilter {
 
-    pub fn compute_wallet_filter (block: &Block, utxo: impl UTXOAccessor) -> Result<BlockFilter, io::Error> {
+    pub fn compute_script_filter(block: &Block, scripts: impl ScriptAccessor) -> Result<BlockFilter, MurmelError> {
         let mut bytes = Vec::new();
         let mut out = Cursor::new(&mut bytes);
         {
             let mut writer = BlockFilterWriter::new(&mut out, block);
-            writer.wallet_filter(utxo)?;
+            writer.add_output_scripts();
+            writer.add_input_scripts(scripts)?;
             writer.finish()?;
         }
-        Ok(BlockFilter{block: block.bitcoin_hash(), filter_type: 1, content: out.into_inner().to_vec()})
+        Ok(BlockFilter{block: block.bitcoin_hash(), filter_type: SCRIPT_FILTER, content: out.into_inner().to_vec()})
+    }
+
+    pub fn compute_coin_filter(block: &Block) -> Result<BlockFilter, MurmelError> {
+        let mut bytes = Vec::new();
+        let mut out = Cursor::new(&mut bytes);
+        {
+            let mut writer = BlockFilterWriter::new(&mut out, block);
+            writer.add_output_coins();
+            writer.finish()?;
+        }
+        Ok(BlockFilter{block: block.bitcoin_hash(), filter_type: COIN_FILTER, content: out.into_inner().to_vec()})
+    }
+
+    pub fn compute_wallet_filter(block: &Block) -> Result<BlockFilter, MurmelError> {
+        let mut bytes = Vec::new();
+        let mut out = Cursor::new(&mut bytes);
+        {
+            let mut writer = BlockFilterWriter::new(&mut out, block);
+            writer.add_output_scripts();
+            writer.add_input_coins();
+            writer.finish()?;
+        }
+        Ok(BlockFilter{block: block.bitcoin_hash(), filter_type: WALLET_FILTER, content: out.into_inner().to_vec()})
     }
 }
 
@@ -75,33 +112,56 @@ impl <'a> BlockFilterWriter<'a> {
     }
 
     /// Add output scripts of the block - excluding OP_RETURN scripts
-    fn add_output_scripts (&mut self) {
+    pub fn add_output_scripts (&mut self) {
         for transaction in &self.block.txdata {
             for output in &transaction.output {
                 if !output.script_pubkey.is_op_return() {
-                    self.writer.add_element(output.script_pubkey.data().as_slice());
+                    self.writer.add_element(output.script_pubkey.as_bytes());
                 }
             }
         }
     }
 
     /// Add consumed output scripts of a block to filter
-    fn add_consumed_scripts (&mut self, mut tx_accessor: impl UTXOAccessor) -> Result<(), io::Error> {
+    pub fn add_input_scripts(&mut self, tx_accessor: impl ScriptAccessor) -> Result<(), MurmelError> {
+        let mut coins = Vec::new();
         for transaction in &self.block.txdata {
             if !transaction.is_coin_base() {
                 for input in &transaction.input {
-                    let (script, _) = tx_accessor.get_utxo(&input.prev_hash, input.prev_index)?;
-                    self.writer.add_element(script.data().as_slice());
+                    coins.push(input.previous_output);
                 }
             }
+        }
+        for script in tx_accessor.get_scripts(coins)? {
+            self.writer.add_element(script.as_bytes());
         }
         Ok(())
     }
 
-    /// compile a filter useful for wallets
-    pub fn wallet_filter (&mut self, tx_accessor: impl UTXOAccessor) -> Result<(), io::Error> {
-        self.add_output_scripts();
-        self.add_consumed_scripts(tx_accessor)
+    pub fn add_output_coins(&mut self) {
+        let mut buf = Vec::with_capacity(40);
+        for tx in &self.block.txdata {
+            let txid = tx.txid();
+            for (vout, o) in tx.output.iter().enumerate() {
+                if !o.script_pubkey.is_op_return() {
+                    let coin = OutPoint { txid, vout: vout as u32 };
+                    coin.consensus_encode(&mut buf).unwrap();
+                    self.writer.add_element(&buf.as_slice());
+                    buf.clear();
+                }
+            }
+        }
+    }
+
+    pub fn add_input_coins(&mut self) {
+        let mut buf = Vec::with_capacity(40);
+        for tx in &self.block.txdata {
+            for input in &tx.input {
+                input.previous_output.consensus_encode(&mut buf).unwrap();
+                self.writer.add_element(&buf);
+                buf.clear();
+            }
+        }
     }
 
     /// Write block filter
@@ -110,23 +170,6 @@ impl <'a> BlockFilterWriter<'a> {
     }
 }
 
-pub trait UTXOAccessor {
-    fn get_utxo(&mut self, txid: &Sha256dHash, ix: u32) -> Result<(Script, u64), io::Error>;
-}
-
-fn encode<T: ? Sized>(data: &T) -> Result<Vec<u8>, io::Error>
-    where T: ConsensusEncodable<RawEncoder<io::Cursor<Vec<u8>>>> {
-    Ok(serialize(data)
-        .map_err(|_| { io::Error::new(io::ErrorKind::InvalidData, "serialization error") })?)
-}
-
-fn serialize<T: ?Sized>(data: &T) -> Result<Vec<u8>, bitcoin::util::Error>
-    where T: ConsensusEncodable<RawEncoder<io::Cursor<Vec<u8>>>>,
-{
-    let mut encoder = RawEncoder::new(io::Cursor::new(vec![]));
-    data.consensus_encode(&mut encoder)?;
-    Ok(encoder.into_inner().into_inner())
-}
 
 /// Reads and interpret a block filter
 pub struct BlockFilterReader {
@@ -142,49 +185,38 @@ impl BlockFilterReader {
         })
     }
 
-    /// add a query pattern
-    pub fn add_query_pattern (&mut self, element: &[u8]) {
-        self.reader.add_query_pattern (element);
+    /// match any query pattern
+    pub fn match_any (&self, reader: &mut io::Read, query: &Vec<Vec<u8>>) -> Result<bool, io::Error> {
+        self.reader.match_any(reader, query)
     }
 
-    /// match any previously added query pattern
-    pub fn match_any (&mut self, reader: &mut io::Read) -> Result<bool, io::Error> {
-        self.reader.match_any(reader)
+    /// match all query pattern
+    pub fn match_all (&self, reader: &mut io::Read, query: &Vec<Vec<u8>>) -> Result<bool, io::Error> {
+        self.reader.match_all(reader, query)
     }
 }
 
 
 struct GCSFilterReader {
-    filter: GCSFilter,
-    query: HashSet<u64>
+    filter: GCSFilter
 }
 
 impl GCSFilterReader {
     fn new (k0: u64, k1: u64) -> Result<GCSFilterReader, io::Error> {
-        Ok(GCSFilterReader {
-            filter: GCSFilter::new(k0, k1),
-            query: HashSet::new() })
+        Ok(GCSFilterReader { filter: GCSFilter::new(k0, k1)})
     }
 
-    fn add_query_pattern (&mut self, element: &[u8]) {
-        self.query.insert (self.filter.hash(element));
-    }
-
-    fn match_any (&mut self, reader: &mut io::Read) -> Result<bool, io::Error> {
-        let mut decoder = RawDecoder::new(reader);
-        let n_elements: VarInt = ConsensusDecodable::consensus_decode(&mut decoder)
+    fn match_any (&self, reader: &mut io::Read, query: &Vec<Vec<u8>>) -> Result<bool, io::Error> {
+        let mut decoder = reader;
+        let n_elements: VarInt = Decodable::consensus_decode(&mut decoder)
             .map_err(|_| io::Error::new(io::ErrorKind::UnexpectedEof, "unexpected EOF"))?;
-        let ref mut reader = decoder.into_inner();
+        let ref mut reader = decoder;
         if n_elements.0 == 0 {
             return Ok(false)
         }
         // map hashes to [0, n_elements << grp]
-        let mut mapped = Vec::new();
-        mapped.reserve(self.query.len());
         let nm = n_elements.0 * M;
-        for h in &self.query {
-            mapped.push(map_to_range(*h, nm));
-        }
+        let mut mapped = query.iter().map(|e| map_to_range(self.filter.hash(e.as_slice()), nm)).collect::<Vec<_>>();
         // sort
         mapped.sort();
 
@@ -201,7 +233,7 @@ impl GCSFilterReader {
                         data += self.filter.golomb_rice_decode(&mut reader)?;
                         remaining -= 1;
                     } else {
-                        break;
+                        return Ok(false);
                     }
                 } else {
                     break;
@@ -209,6 +241,43 @@ impl GCSFilterReader {
             }
         }
         Ok(false)
+    }
+
+    fn match_all (&self, reader: &mut io::Read, query: &Vec<Vec<u8>>) -> Result<bool, io::Error> {
+        let mut decoder = reader;
+        let n_elements: VarInt = Decodable::consensus_decode(&mut decoder)
+            .map_err(|_| io::Error::new(io::ErrorKind::UnexpectedEof, "unexpected EOF"))?;
+        let ref mut reader = decoder;
+        if n_elements.0 == 0 {
+            return Ok(false)
+        }
+        // map hashes to [0, n_elements << grp]
+        let nm = n_elements.0 * M;
+        let mut mapped = query.iter().map(|e| map_to_range(self.filter.hash(e.as_slice()), nm)).collect::<Vec<_>>();
+        // sort
+        mapped.sort();
+
+        // figure if all mapped are there in one read pass
+        let mut reader = BitStreamReader::new(reader);
+        let mut data = self.filter.golomb_rice_decode(&mut reader)?;
+        let mut remaining = n_elements.0 - 1;
+        for p in mapped {
+            loop {
+                if data == p {
+                    break;
+                } else if data < p {
+                    if remaining > 0 {
+                        data += self.filter.golomb_rice_decode(&mut reader)?;
+                        remaining -= 1;
+                    } else {
+                        return Ok(false);
+                    }
+                } else {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -236,9 +305,9 @@ impl<'a> GCSFilterWriter<'a> {
 
     fn finish (&mut self) -> Result<usize, io::Error> {
         // write number of elements as varint
-        let mut encoder = RawEncoder::new(io::Cursor::new(Vec::new()));
+        let mut encoder = io::Cursor::new(Vec::new());
         VarInt(self.elements.len() as u64).consensus_encode(&mut encoder).unwrap();
-        let mut wrote = self.writer.write(encoder.into_inner().into_inner().as_slice())?;
+        let mut wrote = self.writer.write(encoder.into_inner().as_slice())?;
         // map hashes to [0, n_elements * M)
         let mut mapped = Vec::new();
         let n = self.elements.len();
@@ -384,7 +453,7 @@ impl<'a> BitStreamWriter<'a> {
     /// flush bits not yet written
     pub fn flush (&mut self) -> Result<usize, io::Error> {
         if self.offset > 0 {
-            self.writer.write(&self.buffer)?;
+            self.writer.write_all(&self.buffer)?;
             self.buffer [0] = 0u8;
             self.offset = 0;
             Ok(1)
@@ -397,14 +466,17 @@ impl<'a> BitStreamWriter<'a> {
 
 #[cfg(test)]
 mod test {
+    use bitcoin::blockdata::script::Script;
+    use bitcoin::blockdata::transaction::OutPoint;
     use blockfilter::test::rustc_serialize::json::Json;
+    use error::MurmelError;
     use rand;
-    use rand::Rng;
+    use rand::RngCore;
+    use std::collections::HashMap;
     use std::fs::File;
     use std::io::Cursor;
     use std::io::Read;
     use std::path::PathBuf;
-    use std::collections::HashMap;
     use super::*;
 
     extern crate rustc_serialize;
@@ -412,21 +484,23 @@ mod test {
     extern crate hex;
 
     fn decode<T: ? Sized>(data: Vec<u8>) -> Result<T, io::Error>
-        where T: ConsensusDecodable<RawDecoder<Cursor<Vec<u8>>>> {
-        let mut decoder: RawDecoder<Cursor<Vec<u8>>> = RawDecoder::new(Cursor::new(data));
-        Ok(ConsensusDecodable::consensus_decode(&mut decoder)
+        where T: Decodable<Cursor<Vec<u8>>> {
+        let mut decoder = Cursor::new(data);
+        Ok(Decodable::consensus_decode(&mut decoder)
             .map_err(|_| { io::Error::new(io::ErrorKind::InvalidData, "serialization error") })?)
     }
 
-    impl UTXOAccessor for HashMap<(Sha256dHash, u32), (Script, u64)> {
-        fn get_utxo(&mut self, txid: &Sha256dHash, ix: u32) -> Result<(Script, u64), io::Error> {
-            if let Some (ux) = self.get(&(*txid, ix)) {
-                Ok(ux.clone())
+    impl ScriptAccessor for HashMap<OutPoint, Script> {
+        fn get_scripts(&self, coins: Vec<OutPoint>) -> Result<Vec<Script>, MurmelError> {
+            let mut result = Vec::new();
+            for coin in coins {
+                if let Some(ux) = self.get(&coin) {
+                    result.push(ux.clone());
+                } else {
+                    panic!("missing {}", coin);
+                }
             }
-            else {
-                println!("missing {}", txid);
-                Err(io::Error::from(io::ErrorKind::NotFound))
-            }
+            Ok(result)
         }
     }
 
@@ -452,7 +526,7 @@ mod test {
 
             for tx in &block.txdata {
                 for (ix, out) in tx.output.iter().enumerate() {
-                    txmap.insert((tx.txid(), ix as u32), (out.script_pubkey.clone(), out.value));
+                    txmap.insert(OutPoint{ txid: tx.txid(), vout: ix as u32}, out.script_pubkey.clone());
                 }
             }
             for i in 1 .. 9 {
@@ -460,7 +534,7 @@ mod test {
                 let tx: bitcoin::blockdata::transaction::Transaction = decode(hex::decode(line[1].as_string().unwrap()).unwrap()).unwrap();
                 assert_eq!(tx.txid().to_string(), line[0].as_string().unwrap());
                 for (ix, out) in tx.output.iter().enumerate() {
-                    txmap.insert((tx.txid(), ix as u32), (out.script_pubkey.clone(), out.value));
+                    txmap.insert(OutPoint{ txid: tx.txid(), vout: ix as u32}, out.script_pubkey.clone());
                 }
             }
 
@@ -468,7 +542,8 @@ mod test {
             let mut constructed_filter = Cursor::new(Vec::new());
             {
                 let mut writer = BlockFilterWriter::new(&mut constructed_filter, &block);
-                writer.wallet_filter(txmap).unwrap();
+                writer.add_output_scripts();
+                writer.add_input_scripts(txmap).unwrap();
                 writer.finish().unwrap();
             }
 
@@ -476,8 +551,8 @@ mod test {
             assert_eq!(test_filter, filter);
             let filter_hash = Sha256dHash::from_data(filter.as_slice());
             let mut header_data = [0u8; 64];
-            header_data[0..32].copy_from_slice(&filter_hash.data()[0..32]);
-            header_data[32..64].copy_from_slice(&previous_header_hash.data()[0..32]);
+            header_data[0..32].copy_from_slice(&filter_hash.as_bytes()[..]);
+            header_data[32..64].copy_from_slice(&previous_header_hash.as_bytes()[..]);
             let filter_header_hash = Sha256dHash::from_data(&header_data);
             assert_eq!(filter_header_hash, header_hash);
         }
@@ -491,40 +566,42 @@ mod test {
         for _ in 0..1000 {
             let mut bytes = [0u8; 8];
             rng.fill_bytes(&mut bytes);
-            patterns.insert(bytes);
+            patterns.insert(bytes.to_vec());
         }
         {
             let mut out = Cursor::new(&mut bytes);
             let mut writer = GCSFilterWriter::new(&mut out, 0, 0);
             for p in &patterns {
-                writer.add_element(p);
+                writer.add_element(p.as_slice());
             }
             writer.finish().unwrap();
         }
         {
-            let ref mut reader = GCSFilterReader::new(0, 0).unwrap();
+            let mut query = Vec::new();
+            let reader = GCSFilterReader::new(0, 0).unwrap();
             let mut it = patterns.iter();
             for _ in 0..5 {
-                reader.add_query_pattern(it.next().unwrap());
+                query.push(it.next().unwrap().clone());
             }
             for _ in 0..100 {
-                let mut p = it.next().unwrap().to_vec();
+                let mut p = it.next().unwrap().clone();
                 p [0] = !p[0];
-                reader.add_query_pattern(p.as_slice());
+                query.push(p);
             }
             let mut input = Cursor::new(&bytes);
-            assert!(reader.match_any(&mut input).unwrap());
+            assert!(reader.match_any(&mut input, &query).unwrap());
         }
         {
-            let mut reader = GCSFilterReader::new(0, 0).unwrap();
+            let reader = GCSFilterReader::new(0, 0).unwrap();
             let mut it = patterns.iter();
+            let mut query = Vec::new();
             for _ in 0..100 {
-                let mut p = it.next().unwrap().to_vec();
+                let mut p = it.next().unwrap().clone();
                 p [0] = !p[0];
-                reader.add_query_pattern(p.as_slice());
+                query.push(p);
             }
             let mut input = Cursor::new(&bytes);
-            assert!(!reader.match_any(&mut input).unwrap());
+            assert!(!reader.match_any(&mut input, &query).unwrap());
         }
     }
 

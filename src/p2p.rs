@@ -1,5 +1,5 @@
 //
-// Copyright 2018 Tamas Blummer
+// Copyright 2018-2019 Tamas Blummer
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,59 +14,135 @@
 // limitations under the License.
 //
 //!
-//! # Dispatcher from network to node and back
+//! # P2P network communication
 //!
 //! This module establishes network connections and routes messages between the P2P network and this node
 //!
 
-use bitcoin::network::constants::{magic, Network};
-use bitcoin::network::encodable::{ConsensusDecodable, ConsensusEncodable};
-use bitcoin::network::message::NetworkMessage;
-use bitcoin::network::message::RawNetworkMessage;
-use bitcoin::network::message_network::VersionMessage;
-use bitcoin::network::serialize::{RawDecoder, RawEncoder};
-use bitcoin::network::address::Address;
-use bitcoin::util;
-use error::SPVError;
-use mio::*;
-use mio::unix::UnixReady;
-use mio::net::{TcpStream, TcpListener};
-use node::{Node, ProcessResult};
-use database::DB;
-use rand::{Rng, StdRng};
-use std::cmp::{min, max};
-use std::collections::{HashMap, VecDeque};
-use std::collections::hash_map::Entry;
-use std::fmt::{Display, Error, Formatter};
-use std::io;
-use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr};
-use std::sync::{Arc, mpsc, RwLock, Mutex};
-use std::sync::atomic::{AtomicUsize, Ordering,AtomicBool};
-use std::time::{SystemTime, UNIX_EPOCH};
-use futures::{Future, Async, FutureExt};
-use futures::task::Context;
-use futures::future;
-use futures::task::Waker;
-use std::time::Duration;
+use bitcoin::{
+    consensus::{Decodable, Encodable, encode}
+};
+use bitcoin::network::{
+    address::Address,
+    constants::Network,
+    message::{NetworkMessage, RawNetworkMessage},
+    message_network::VersionMessage
+};
+
+use error::MurmelError;
+use futures::{
+    Async, Future, future, FutureExt,
+    task::{Context, Waker}
+};
+use mio::{
+    Event, Events, net::{TcpListener, TcpStream}, Poll, PollOpt, Ready,
+    Token,
+    unix::UnixReady
+};
+use rand::{RngCore, thread_rng};
+use std::{
+    cmp::{max, min},
+    collections::{HashMap, VecDeque},
+    fmt,
+    io,
+    io::{Read, Write},
+    net::{Shutdown, SocketAddr},
+    sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}, mpsc, Mutex,
+           RwLock
+    },
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH}
+};
+
 
 const IO_BUFFER_SIZE:usize = 1024*1024;
 const EVENT_BUFFER_SIZE:usize = 1024;
-const CONNECT_TIMEOUT_SECONDS: u64 = 10;
+const CONNECT_TIMEOUT_SECONDS: u64 = 30;
 const BAN :u32 = 100;
 
+pub const SERVICE_BLOCKS:u64 = 1;
+pub const SERVICE_WITNESS:u64 =  1 << 3;
+pub const SERVICE_FILTERS:u64 = 1 << 6;
 /// A peer's Id
-/// used in log messages and as key to PeerMap
 #[derive(Hash, Eq, PartialEq, Copy, Clone)]
 pub struct PeerId {
-    /// mio token used in networking
-    pub token: Token
+    // mio token used in networking
+    token: Token
 }
 
-impl Display for PeerId {
-    fn fmt(&self, f: &mut Formatter) -> Result<(), Error> {
+impl fmt::Display for PeerId {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(f, "{}", self.token.0)?;
         Ok(())
+    }
+}
+type PeerMap = HashMap<PeerId, Mutex<Peer>>;
+
+#[derive(Clone)]
+pub enum PeerMessage {
+    Message(PeerId, NetworkMessage),
+    Connected(PeerId),
+    Disconnected(PeerId)
+}
+
+impl PeerMessage {
+    pub fn peer_id (&self) -> PeerId {
+        match self {
+            PeerMessage::Message(pid, _) |
+            PeerMessage::Connected(pid) |
+            PeerMessage::Disconnected(pid) => pid.clone()
+        }
+    }
+}
+
+pub enum P2PControl {
+    Send(PeerId, NetworkMessage),
+    Broadcast(NetworkMessage),
+    Ban(PeerId, u32),
+    Height(u32),
+    Bind(SocketAddr)
+}
+
+type P2PControlReceiver = mpsc::Receiver<P2PControl>;
+
+#[derive(Clone)]
+pub struct P2PControlSender {
+    sender: Arc<Mutex<mpsc::Sender<P2PControl>>>,
+    peers: Arc<RwLock<PeerMap>>,
+    pub back_pressure: usize
+}
+
+impl P2PControlSender {
+    fn new (sender: mpsc::Sender<P2PControl>, peers: Arc<RwLock<PeerMap>>, back_pressure: usize) -> P2PControlSender {
+        P2PControlSender { sender: Arc::new(Mutex::new(sender)), peers, back_pressure }
+    }
+
+    pub fn send (&self, control: P2PControl) {
+        self.sender.lock().unwrap().send(control).expect("P2P control send failed");
+    }
+
+    pub fn send_network (&self, peer: PeerId, msg: NetworkMessage) {
+        self.send(P2PControl::Send(peer, msg))
+    }
+
+    pub fn broadcast (&self, msg: NetworkMessage) {
+        self.send(P2PControl::Broadcast(msg))
+    }
+
+    pub fn ban(&self, peer: PeerId, increment: u32) {
+        self.send(P2PControl::Ban(peer, increment))
+    }
+
+    pub fn peer_version (&self, peer: PeerId) -> Option<VersionMessage> {
+        if let Some(peer) = self.peers.read().unwrap().get(&peer) {
+            let locked_peer = peer.lock().unwrap();
+            return locked_peer.version.clone();
+        }
+        None
+    }
+
+    pub fn peers (&self) -> Vec<PeerId> {
+        self.peers.read().unwrap().keys().cloned().collect::<Vec<_>>()
     }
 }
 
@@ -77,15 +153,40 @@ pub enum PeerSource {
 }
 
 /// a map of peer id to peers
-/// This map is shared between P2P and node
-/// and is protected with an rw lock
-/// Peers are mutex protected as sends
-/// to them may be coming from different peers
-pub type PeerMap = HashMap<PeerId, Mutex<Peer>>;
+pub type PeerMessageReceiver = mpsc::Receiver<PeerMessage>;
+
+#[derive(Clone)]
+pub struct PeerMessageSender {
+    sender: Option<Arc<Mutex<mpsc::SyncSender<PeerMessage>>>>
+}
+
+impl PeerMessageSender {
+    pub fn new (sender: mpsc::SyncSender<PeerMessage>) -> PeerMessageSender {
+        PeerMessageSender { sender: Some(Arc::new(Mutex::new(sender))) }
+    }
+
+    pub fn dummy () -> PeerMessageSender {
+        PeerMessageSender{ sender: None }
+    }
+
+    pub fn send (&self, msg: PeerMessage) {
+        if let Some(ref sender) = self.sender {
+            sender.lock().unwrap().send(msg).expect("P2P message send failed");
+        }
+    }
+
+    pub fn send_network(&self, peer: PeerId, msg: NetworkMessage) {
+        if let Some(ref sender) = self.sender {
+            sender.lock().unwrap().send(PeerMessage::Message(peer, msg)).expect("P2P message send failed");
+        }
+    }
+}
 
 /// The P2P network layer
 pub struct P2P {
     pub network: Network,
+    // sender to the dispatcher of incoming messages
+    dispatcher: PeerMessageSender,
     // network specific message prefix
     magic: u32,
     // This node's identifier on the network (random)
@@ -95,7 +196,6 @@ pub struct P2P {
     // This node's human readable type identification
     user_agent: String,
     // The collection of connected peers
-    // access to this is shared with node and is rw lock protected
     peers: Arc<RwLock<PeerMap>>,
     // The poll object of the async IO layer (mio)
     // access to this is shared by P2P and Peer
@@ -103,37 +203,80 @@ pub struct P2P {
     // next peer id
     // atomic only for interior mutability
     next_peer_id: AtomicUsize,
-    // database
-    db: Arc<Mutex<DB>>,
     // waker
     waker: Arc<Mutex<HashMap<PeerId, Waker>>>,
     // server
     listener: Arc<Mutex<HashMap<Token, Arc<TcpListener>>>>,
     // this node's maximum protocol version
     max_protocol_version: u32,
+    // is this a filter (BIP157) server?
+    filter_server: bool
 }
 
 impl P2P {
     /// create a new P2P network controller
-    pub fn new(user_agent: String, network: Network, height: u32, peers: Arc<RwLock<PeerMap>>, db: Arc<Mutex<DB>>, max_protocol_version: u32) -> P2P {
-        let mut rng = StdRng::new().unwrap();
-        P2P {
+    pub fn new(user_agent: String, network: Network, height: u32, max_protocol_version: u32, filter_server: bool, dispatcher: PeerMessageSender, back_pressure: usize) -> (Arc<P2P>, P2PControlSender) {
+        let (control_sender, control_receiver) = mpsc::channel();
+
+        let mut rng =  thread_rng();
+        let magic = network.magic();
+
+        let peers = Arc::new(RwLock::new(PeerMap::new()));
+
+        let p2p = Arc::new(P2P {
             network: network,
-            magic: magic(network),
+            dispatcher,
+            magic,
             nonce: rng.next_u64(),
             height: AtomicUsize::new(height as usize),
             user_agent,
-            peers,
+            peers: peers.clone(),
             poll: Arc::new(Poll::new().unwrap()),
             next_peer_id: AtomicUsize::new(0),
-            db,
             waker: Arc::new(Mutex::new(HashMap::new())),
             listener: Arc::new(Mutex::new(HashMap::new())),
-            max_protocol_version: max_protocol_version
-        }
+            max_protocol_version: max_protocol_version,
+            filter_server
+        });
+
+        let p2p2 = p2p.clone();
+
+        thread::spawn(move || p2p2.control_loop(control_receiver));
+
+        (p2p, P2PControlSender::new(control_sender, peers, back_pressure))
     }
 
-    pub fn add_listener (&self, bind: &SocketAddr) -> Result<(), io::Error> {
+    fn control_loop (&self, receiver: P2PControlReceiver) {
+        while let Ok(control) = receiver.recv() {
+            match control {
+                P2PControl::Ban(peer_id, score) => {
+                    self.ban(peer_id, score);
+                },
+                P2PControl::Height(height) => {
+                    self.height.store (height as usize, Ordering::Relaxed);
+                }
+                P2PControl::Bind(addr) => {
+                    match self.add_listener(&addr) {
+                        Ok(()) => info!("listen to {}", addr),
+                        Err(err) => info!("failed to listen to {} with {}", addr, err)
+                    }
+                },
+                P2PControl::Broadcast(message) => {
+                    for peer in self.peers.read().unwrap().values() {
+                        peer.lock().unwrap().send(message.clone()).expect("could not send to peer");
+                    }
+                }
+                P2PControl::Send(peer_id, message) => {
+                    if let Some (peer) = self.peers.read().unwrap().get (&peer_id) {
+                        peer.lock().unwrap().send(message).expect("could not send to peer");
+                    }
+                }
+            }
+        }
+        panic!("P2P Control loop failed");
+    }
+
+    fn add_listener (&self, bind: &SocketAddr) -> Result<(), io::Error> {
         let listener = TcpListener::bind(bind)?;
         let token = Token(self.next_peer_id.fetch_add(1, Ordering::Relaxed));
         self.poll.register(&listener, token, Ready::readable(), PollOpt::edge())?;
@@ -142,7 +285,7 @@ impl P2P {
     }
 
     /// return a future that does not complete until the peer is connected
-    pub fn add_peer (&self, source: PeerSource) -> Box<Future<Item=SocketAddr, Error=SPVError> + Send> {
+    pub fn add_peer (&self, source: PeerSource) -> Box<Future<Item=SocketAddr, Error=MurmelError> + Send> {
         // new token, never re-using previously connected peer's id
         // so log messages are easier to follow
         let token = Token(self.next_peer_id.fetch_add(1, Ordering::Relaxed));
@@ -152,19 +295,12 @@ impl P2P {
 
         let peers = self.peers.clone();
         let peers2 = self.peers.clone();
-        let db = self.db.clone();
 
         Box::new(connect
             .map_err (move |e| {
                 // remove peers and candidates entry
                 info!("timeout on handshake peer={}", pid);
                 peers2.write().unwrap().remove(&pid);
-                if let PeerSource::Outgoing(address) = source {
-                    let mut db = db.lock().unwrap();
-                    let transaction = db.transaction().unwrap();
-                    transaction.remove_peer(&address).unwrap_or(0);
-                    transaction.commit().unwrap();
-                }
                 e
             })
             .and_then (move|address| {
@@ -181,14 +317,14 @@ impl P2P {
     }
 
     /// return a future that resolves to a connected (handshake perfect) peer or timeout
-    pub fn connect_peer_with_timeout (&self, pid: PeerId, seconds: u64, source: PeerSource) -> Box<Future<Item=SocketAddr, Error=SPVError> + Send> {
+    pub fn connect_peer_with_timeout (&self, pid: PeerId, seconds: u64, source: PeerSource) -> Box<Future<Item=SocketAddr, Error=MurmelError> + Send> {
         use futures_timer::FutureExt;
 
         Box::new(self.connect_peer(pid, source).timeout(Duration::from_secs(seconds)))
     }
 
     // connect a peer
-    fn connect_peer(&self, pid: PeerId, source: PeerSource) -> Box<Future<Item=SocketAddr, Error=SPVError> + Send> {
+    fn connect_peer(&self, pid: PeerId, source: PeerSource) -> Box<Future<Item=SocketAddr, Error=MurmelError> + Send> {
         let peers = self.peers.clone();
         let waker = self.waker.clone();
 
@@ -219,7 +355,7 @@ impl P2P {
     }
 
     // initiate connection to peer
-    fn initiate_connect(&self, pid: PeerId, source: PeerSource) -> Result<SocketAddr, SPVError> {
+    fn initiate_connect(&self, pid: PeerId, source: PeerSource) -> Result<SocketAddr, MurmelError> {
         let outgoing;
         let addr;
         let stream;
@@ -242,7 +378,6 @@ impl P2P {
         // create lock protected peer object
         let peer = Mutex::new(Peer::new(pid, stream,self.poll.clone(), outgoing)?);
 
-        // add peer object to peer map shared between P2P and node
         let mut peers = self.peers.write().unwrap();
 
         // add to peer map
@@ -257,7 +392,7 @@ impl P2P {
         }
         if outgoing {
             // send this node's version message to peer
-            peers.get(&pid).unwrap().lock().unwrap().send(&self.version(&addr, self.max_protocol_version))?;
+            peers.get(&pid).unwrap().lock().unwrap().send(self.version(&addr, self.max_protocol_version))?;
         }
 
         Ok(addr)
@@ -268,7 +403,17 @@ impl P2P {
         // now in unix time
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
 
-        let services = if self.listener.lock().unwrap().is_empty() { 0 } else { 9 };
+        let services = if self.listener.lock().unwrap().is_empty() {
+            0
+        } else {
+            SERVICE_BLOCKS + SERVICE_WITNESS + if self.filter_server {
+                // announce that this node is capable of serving BIP157 messages
+                SERVICE_FILTERS
+            }
+            else {
+                0
+            }
+        };
 
         // build message
         NetworkMessage::Version(VersionMessage {
@@ -285,38 +430,49 @@ impl P2P {
         })
     }
 
-    /// ban a peer
-    pub fn ban (&self, pid: PeerId) -> Result<(), SPVError> {
-        info!("banning peer={}", pid);
-        if let Some(peer) = self.peers.read().unwrap().get(&pid) {
-            let locked_peer = peer.lock().unwrap();
-            let mut db = self.db.lock().unwrap();
-            let transaction = db.transaction()?;
-            transaction.ban (&(locked_peer.stream.peer_addr()?))?;
-            transaction.commit()?;
-        }
-        self.disconnect(pid);
-        Ok(())
-    }
-
     fn disconnect (&self, pid: PeerId) {
-        if let Entry::Occupied(waker_entry) = self.waker.lock().unwrap().entry(pid) {
-            trace!("waking for disconnect");
-            waker_entry.get().wake ();
-            waker_entry.remove();
+        {
+            let mut wakers = self.waker.lock().unwrap();
+            if let Some(waker) = wakers.get(&pid) {
+                trace!("waking for disconnect");
+                waker.wake();
+            }
+            wakers.remove(&pid);
         }
-        if let Entry::Occupied(peer_entry) = self.peers.write().unwrap().entry(pid) {
-            peer_entry.get().lock().unwrap().stream.shutdown(Shutdown::Both).unwrap_or(());
-            peer_entry.remove();
+        {
+            let mut peers = self.peers.write().unwrap();
+            if let Some(peer) = peers.get(&pid) {
+                peer.lock().unwrap().stream.shutdown(Shutdown::Both).unwrap_or(());
+            }
+            peers.remove(&pid);
+        }
+        self.dispatcher.send(PeerMessage::Disconnected(pid));
+    }
+
+    fn connected(&self, pid: PeerId) {
+        self.dispatcher.send(PeerMessage::Connected(pid));
+    }
+
+    fn ban (&self, pid: PeerId, increment: u32) {
+        let mut disconnect = false;
+        if let Some(peer) = self.peers.read().unwrap().get(&pid) {
+            let mut locked_peer = peer.lock().unwrap();
+            locked_peer.ban += increment;
+            trace!("ban score {} for peer={}", locked_peer.ban, pid);
+            if locked_peer.ban >= BAN {
+                disconnect = true;
+            }
+        }
+        if disconnect {
+            self.disconnect(pid);
         }
     }
 
-    fn event_processor (&self, node: Arc<Node>, event: Event, pid: PeerId, iobuf: &mut [u8], ctx: &mut Context) -> Result<(), SPVError> {
+    fn event_processor (&self, event: Event, pid: PeerId, needed_services: u64, iobuf: &mut [u8]) -> Result<(), MurmelError> {
         let readiness = UnixReady::from(event.readiness());
         // check for error first
         if readiness.is_hup() || readiness.is_error() {
             info!("left us peer={}", pid);
-            node.disconnected(pid)?;
             self.disconnect(pid);
         } else {
             // check for ability to write before read, to get rid of data before buffering more read
@@ -393,7 +549,7 @@ impl P2P {
                     if let Ok(len) = locked_peer.stream.read(iobuf) {
                         trace!("received {} bytes from peer={}", len, pid);
                         // accumulate in a buffer
-                        locked_peer.read_buffer.write(&iobuf[0..len])?;
+                        locked_peer.read_buffer.write_all(&iobuf[0..len])?;
                         // extract messages from the buffer
                         while let Some(msg) = decode(&mut locked_peer.read_buffer)? {
                             trace!("received {} peer={}", msg.command(), pid);
@@ -417,8 +573,8 @@ impl P2P {
                                                 disconnect = true;
                                                 break;
                                             } else {
-                                                // want to connect to full nodes supporting segwit
-                                                if false {// version.services & 9 != 9 || version.version < 70013 {
+                                                if version.version < 70001 || (needed_services & version.services) != needed_services {
+                                                    debug!("rejecting peer of version {} and services {:b} peer={}", version.version, version.services, pid);
                                                     disconnect = true;
                                                     break;
                                                 } else {
@@ -428,10 +584,11 @@ impl P2P {
                                                         trace!("send version to incoming connection {}", addr);
                                                         // do not show higher version than the peer speaks
                                                         let version = self.version (&addr, version.version);
-                                                        locked_peer.send(&version)?;
+                                                        locked_peer.send(version)?;
                                                     }
+                                                    debug!("accepting peer of version {} and services {:b} peer={}", version.version, version.services, pid);
                                                     // acknowledge version message received
-                                                    locked_peer.send(&NetworkMessage::Verack)?;
+                                                    locked_peer.send(NetworkMessage::Verack)?;
                                                     // all right, remember this peer
                                                     info!("client {} height: {} peer={}", version.user_agent, version.start_height, pid);
                                                     let mut vm = version.clone();
@@ -471,13 +628,12 @@ impl P2P {
                 }
                 if disconnect {
                     info!("left us peer={}", pid);
-                    node.disconnected(pid)?;
                     self.disconnect(pid);
                 }
                 else {
                     if handshake {
                         info!("handshake peer={}", pid);
-                        node.connected (pid, ctx)?;
+                        self.connected (pid);
                         if let Some(w) = self.waker.lock().unwrap().get(&pid) {
                             trace!("waking for handshake");
                             w.wake();
@@ -487,28 +643,7 @@ impl P2P {
                     // as process could call back to P2P
                     for msg in incoming {
                         trace!("processing {} for peer={}", msg.command(), pid);
-                        match node.process (&msg.payload, pid, ctx)? {
-                            ProcessResult::Ack => { trace!("ack {} peer={}", msg.command(), pid); },
-                            ProcessResult::Ignored => { trace!("ignored {} peer={}", msg.command(), pid); }
-                            ProcessResult::Ban(increment) => {
-                                let mut disconnect = false;
-                                if let Some(peer) = self.peers.read().unwrap().get(&pid) {
-                                    let mut locked_peer = peer.lock().unwrap();
-                                    locked_peer.ban += increment;
-                                    trace!("ban score {} for peer={}", locked_peer.ban, pid);
-                                    if locked_peer.ban >= BAN {
-                                       disconnect = true;
-                                    }
-                                }
-                                if disconnect {
-                                    node.disconnected(pid)?;
-                                    self.ban (pid)?;
-                                }
-                            }
-                            ProcessResult::Height(new_height) => {
-                                self.height.store(new_height as usize, Ordering::Relaxed);
-                            }
-                        }
+                        self.dispatcher.send(PeerMessage::Message(pid, msg.payload));
                     }
                 }
             }
@@ -519,8 +654,7 @@ impl P2P {
     /// run the message dispatcher loop
     /// this method does not return unless there is an error obtaining network events
     /// run in its own thread, which will process all network events
-    pub fn run(&self, node: Arc<Node>, ctx: &mut Context) -> Result<(), io::Error>{
-        node.init_before_p2p(ctx);
+    pub fn run(&self, needed_services: u64, ctx: &mut Context) -> Result<(), io::Error>{
         trace!("start mio event loop");
         loop {
             // events buffer
@@ -544,7 +678,7 @@ impl P2P {
                 else {
                     // construct the id of the peer the event concerns
                     let pid = PeerId { token: event.token() };
-                    if let Err(error) = self.event_processor(node.clone(), event, pid, iobuf.as_mut_slice(), ctx) {
+                    if let Err(error) = self.event_processor(event, pid, needed_services, iobuf.as_mut_slice()) {
                         use std::error::Error;
 
                         warn!("error {} peer={}", error.to_string(), pid);
@@ -564,7 +698,7 @@ impl P2P {
 }
 
 /// a peer
-pub struct Peer {
+struct Peer {
     /// the peer's id for log messages
     pub pid: PeerId,
     // the event poller, shared with P2P, needed here to register for events
@@ -573,7 +707,7 @@ pub struct Peer {
     stream: TcpStream,
     // temporary buffer for not yet completely read incoming messages
     read_buffer: Buffer,
-    // temporary buffer for not yet completely written outgoind messages
+    // temporary buffer for not yet completely written outgoing messages
     write_buffer: Buffer,
     // did the remote peer already sent a verack?
     got_verack: bool,
@@ -595,7 +729,7 @@ pub struct Peer {
 
 impl Peer {
     /// create a new peer
-    pub fn new (pid: PeerId, stream: TcpStream, poll: Arc<Poll>, outgoing: bool) -> Result<Peer, SPVError> {
+    pub fn new (pid: PeerId, stream: TcpStream, poll: Arc<Poll>, outgoing: bool) -> Result<Peer, MurmelError> {
         let (sender, receiver) = mpsc::channel();
         let peer = Peer{pid, poll: poll.clone(), stream, read_buffer: Buffer::new(), write_buffer: Buffer::new(),
             got_verack: false, version: None, sender, receiver, writeable: AtomicBool::new(false),
@@ -604,7 +738,7 @@ impl Peer {
     }
 
     // re-register for peer readable events
-    fn reregister_read(&self) -> Result<(), SPVError> {
+    fn reregister_read(&self) -> Result<(), MurmelError> {
         if self.writeable.swap(false, Ordering::Acquire) {
             trace!("re-register for read peer={}", self.pid);
             self.poll.reregister(&self.stream, self.pid.token, Ready::readable() | UnixReady::error() | UnixReady::hup(), PollOpt::level())?;
@@ -613,7 +747,7 @@ impl Peer {
     }
 
     // register for peer readable events
-    fn register_read(&self) -> Result<(), SPVError> {
+    fn register_read(&self) -> Result<(), MurmelError> {
         trace!("register for read peer={}", self.pid);
         self.poll.register(&self.stream, self.pid.token, Ready::readable() | UnixReady::error() | UnixReady::hup(), PollOpt::level())?;
         self.writeable.store(false, Ordering::Relaxed);
@@ -621,16 +755,16 @@ impl Peer {
     }
 
     /// send a message to P2P network
-    pub fn send (&self, msg: &NetworkMessage) -> Result<(), SPVError> {
+    pub fn send (&self, msg: NetworkMessage) -> Result<(), MurmelError> {
         // send to outgoing message channel
-        self.sender.send(msg.clone()).map_err(| _ | SPVError::Generic("can not send to peer queue".to_owned()))?;
+        self.sender.send(msg).map_err(| _ | MurmelError::Downstream("can not send to peer queue".to_owned()))?;
         // register for writable peer events since we have outgoing message
         self.reregister_write()?;
         Ok(())
     }
 
     // register for peer writable events
-    fn reregister_write(&self) -> Result<(), SPVError> {
+    fn reregister_write(&self) -> Result<(), MurmelError> {
         if !self.writeable.swap(true, Ordering::Acquire) {
             trace!("re-register for write peer={}", self.pid);
             self.poll.reregister(&self.stream, self.pid.token, Ready::writable() | UnixReady::error() | UnixReady::hup(), PollOpt::level())?;
@@ -639,7 +773,7 @@ impl Peer {
     }
 
     // register for peer writable events
-    fn register_write(&self) -> Result<(), SPVError> {
+    fn register_write(&self) -> Result<(), MurmelError> {
         trace!("register for write peer={}", self.pid);
         self.poll.register(&self.stream, self.pid.token, Ready::writable() | UnixReady::error() | UnixReady::hup(), PollOpt::level())?;
         self.writeable.store(true, Ordering::Relaxed);
@@ -835,8 +969,8 @@ impl Read for Buffer {
 }
 
 // encode a message in Bitcoin's wire format extending the given buffer
-fn encode(item: &RawNetworkMessage, dst: &mut Buffer) -> Result<(), io::Error> {
-    match item.consensus_encode(&mut RawEncoder::new(dst)) {
+fn encode(item: &RawNetworkMessage, mut dst: &mut Buffer) -> Result<(), io::Error> {
+    match item.consensus_encode(&mut dst) {
         Ok(_) => Ok(()),
         Err(e) => Err(io::Error::new(io::ErrorKind::WriteZero, e))
     }
@@ -845,10 +979,8 @@ fn encode(item: &RawNetworkMessage, dst: &mut Buffer) -> Result<(), io::Error> {
 // decode a message from the buffer if possible
 fn decode(src: &mut Buffer) -> Result<Option<RawNetworkMessage>, io::Error> {
     // attempt to decode
-    let mut raw = RawDecoder::new(src);
-    let decode: Result<RawNetworkMessage, util::Error> =
-        ConsensusDecodable::consensus_decode(&mut raw);
-    let src = raw.into_inner();
+    let decode: Result<RawNetworkMessage, encode::Error> =
+        Decodable::consensus_decode(src);
 
     match decode {
         Ok(m) => {
@@ -856,14 +988,16 @@ fn decode(src: &mut Buffer) -> Result<Option<RawNetworkMessage>, io::Error> {
             src.commit();
             Ok(Some(m))
         }
-        Err(util::Error::ByteOrder(_)) => {
-            // failure: partial message, rollback to last commit and retry later
-            src.rollback();
-            Ok(None)
+        Err(encode::Error::Io(e)) => {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                // need more data, rollback and retry after additional read
+                src.rollback();
+                return Ok(None)
+            } else {
+                return Err(e);
+            }
         },
         Err(e) => {
-            // some serious error (often checksum)
-            trace!("invalid data in codec: {}", e);
             Err(io::Error::new(io::ErrorKind::InvalidData, e))
         }
     }

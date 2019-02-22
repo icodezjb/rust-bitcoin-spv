@@ -1,5 +1,5 @@
 //
-// Copyright 2018 Tamas Blummer
+// Copyright 2018-2019 Tamas Blummer
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,32 +14,36 @@
 // limitations under the License.
 //
 extern crate bitcoin;
-extern crate bitcoin_spv;
 extern crate log;
+extern crate murmel;
 extern crate rand;
 extern crate simple_logger;
 
-use std::env::args;
-
 use bitcoin::network::constants::Network;
-use bitcoin_spv::spv::SPV;
 use log::Level;
-use std::net::SocketAddr;
+use murmel::constructor::Constructor;
+use std::env::args;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::Path;
+use std::str::FromStr;
 
-/// simple test drive that connects to a local bitcoind
 pub fn main() {
     if find_opt("help") {
+        println!("Murmel Server");
         println!("{} [--help] [--log trace|debug|info|warn|error] [--connections n] [--peer ip_address:port] [--db database_file] [--network main|test]", args().next().unwrap());
+        println!("warning: due to a bug in args parsing options without args must be after options with args");
         println!("--log level: level is one of trace|debug|info|warn|error");
         println!("--connections n: maintain at least n connections");
         println!("--peer ip_address: connect to the given peer at start. You may use more than one --peer option.");
-        println!("--db file: store data in the given sqlite datbase file. Created if does not exist.");
+        println!("--db file: store data in the given sqlite database file. Created if does not exist.");
         println!("--network net: net is one of main|test for corresponding Bitcoin networks");
         println!("--listen ip_address:port : accept incoming connection requests");
         println!("--nodns : do not use dns seed");
+        println!("--utxo-cache : cache of utxo in millions - set it up to 60 if doing initial load and you have plenty of RAM");
         println!("defaults:");
-        println!("--log info");
+        println!("--db server.db");
+        println!("--log debug");
+        println!("--listen 127.0.0.1:8333");
         println!("--connections 1");
         println!("--network main");
         println!("in memory database");
@@ -56,7 +60,7 @@ pub fn main() {
         }
     }
     else {
-        simple_logger::init_with_level(Level::Info).unwrap();
+        simple_logger::init_with_level(Level::Debug).unwrap();
     }
 
     let mut network = Network::Bitcoin;
@@ -68,25 +72,29 @@ pub fn main() {
         }
     }
 
+    let mut cache = 0;
+    if let Some(numstring) = find_arg("utxo-cache") {
+        cache = 1024usize *1024usize * numstring.parse::<usize>().unwrap() as usize;
+    }
+
     let peers = get_peers();
     let mut connections = 1;
     if let Some(numstring) = find_arg("connections") {
         connections = numstring.parse().unwrap();
     }
     let mut spv;
+    let mut listen = get_listeners();
+    if listen.is_empty() {
+        listen.push(SocketAddr::from(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8333)));
+    }
     if let Some(path) = find_arg("db") {
-        spv = SPV::new("/rust-spv:0.1.0/".to_string(), network, Path::new(path.as_str())).unwrap();
+        spv = Constructor::new("/Murmel:0.1.0/".to_string(), network, Path::new(path.as_str()),  listen, true, cache, 0).unwrap();
     }
     else {
-        spv = SPV::new_in_memory("/rust-spv:0.1.0/".to_string(), network).unwrap();
+        spv = Constructor::new("/Murmel:0.1.0/".to_string(), network, Path::new("server.db"), listen, true, cache, 0).unwrap();
     }
-    for bind in get_listeners() {
-        spv.listen(&bind).expect(format!("can not listen to {:?}", bind).as_str());
-    }
-    spv.start(peers, connections, find_opt("nodns"));
+    spv.run(peers, connections, find_opt("nodns")).expect("can not start node");
 }
-
-use std::str::FromStr;
 
 fn get_peers() -> Vec<SocketAddr> {
     find_args("peer").iter().map(|s| SocketAddr::from_str(s).unwrap()).collect()
